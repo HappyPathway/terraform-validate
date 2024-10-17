@@ -1,0 +1,252 @@
+name: "Terraform Tset and Validate"
+
+description: "A composite action to handle Terraform operations and auto-formatting."
+
+inputs:
+  terraform_version:
+    required: true
+    description: "The version of Terraform to use"
+  terraform_api:
+    required: true
+    description: "The Terraform API endpoint"
+  github_username:
+    required: true
+    description: "GitHub username"
+  github_email:
+    required: true
+    description: "GitHub email"
+  github_org:
+    required: true
+    description: "GitHub organization"
+  github_server:
+    required: false
+    default: github.com
+    description: "GitHub server (default: github.com)"
+  autoformat_message:
+    required: false
+    default: "AutoFormat Commit"
+    description: "Commit message for auto-formatting"
+  setup_terraform:
+    required: false
+    default: "false"
+    description: "Flag to setup Terraform"
+  workspace:
+    required: false
+    description: "Terraform workspace"
+  terraform_init:
+    required: false
+    default: "false"
+    description: "Flag to initialize Terraform"
+  varfile:
+    required: false
+    description: "Path to the Terraform variable file"
+  AWS_ACCESS_KEY_ID:
+    required: false
+    description: "AWS Access Key ID"
+  download_cache:
+    required: false
+    default: "false"
+    description: "Flag to download cache"
+  cache:
+    required: false
+    description: "Cache name"
+  commit_sha:
+    required: false
+    description: "Commit SHA"
+
+outputs:
+  commit_sha:
+    description: "Commit SHA"
+    value: ${{ inputs.commit_sha == '' && github.head_ref || inputs.commit_sha }}
+
+runs:
+  using: "composite"
+
+  steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      id: checkout
+      with:
+        ref: ${{ inputs.commit_sha == '' && github.head_ref || inputs.commit_sha }}
+        persist-credentials: false
+
+    - name: Download Cache
+      uses: actions/download-artifact@master
+      if: ${{ inputs.download_cache }}
+      with:
+        name: ${{ inputs.cache }}
+        path: terraform_data
+
+    - name: Create .terraform Directory
+      shell: bash
+      if: ${{ inputs.download_cache }}
+      run: mkdir .terraform
+
+    - name: Set TF Data Dir
+      shell: bash
+      if: ${{ inputs.download_cache }}
+      run: mv terraform_data/terraform_dir/* .terraform/
+
+    - name: Fix File Permissions
+      shell: bash
+      if: ${{ inputs.download_cache }}
+      run: chmod -R 777 .terraform
+
+    - name: Download Lockfile
+      uses: actions/download-artifact@master
+      if: ${{ inputs.download_cache }}
+      with:
+        name: terraform_lockfile
+        path: terraform_lockfile
+
+    - name: Move Lockfile
+      shell: bash
+      if: ${{ inputs.download_cache }}
+      run: mv terraform_lockfile/.terraform.lock.hcl .
+
+    - name: Fix Lockfile Permissions
+      shell: bash
+      if: ${{ inputs.download_cache }}
+      run: chmod -R 600 .terraform.lock.hcl
+
+    - name: Setup Node
+      uses: actions/setup-node@v3
+      with:
+        node-version: 16
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3.1.2
+      if: ${{ inputs.setup_terraform }}
+      with:
+        terraform_version: ${{ inputs.terraform_version }}
+        cli_config_credentials_token: ${{ secrets.TFE_TOKEN }}
+        cli_config_credentials_hostname: ${{ inputs.terraform_api }}
+
+    - name: Terraform Format
+      shell: bash
+      id: fmt
+      run: terraform fmt
+
+    - name: Set Workspace
+      shell: bash
+      if: ${{ inputs.workspace != '' }}
+      run: echo "TF_WORKSPACE=${{ inputs.workspace }}" >> $GITHUB_ENV
+
+    - name: Set Varfile
+      shell: bash
+      if: ${{ inputs.varfile != '' }}
+      run: echo "TF_CLI_ARGS=-var-file=${{ inputs.varfile }}" >> $GITHUB_ENV
+
+    - name: Terraform Init
+      shell: bash
+      id: init
+      if: ${{ inputs.terraform_init }}
+      run: terraform init -upgrade
+
+    - name: Terraform Validate
+      id: validate
+      shell: bash
+      run: terraform validate -no-color
+
+    - name: Terraform Test
+      id: test
+      shell: bash
+      run: terraform test -no-color
+
+    - name: Render Terraform Docs
+      uses: terraform-docs/gh-actions@v1.2.0
+      if: github.event_name == 'pull_request'
+      with:
+        working-dir: .
+        output-file: README.md
+        output-method: inject
+
+    - name: Fix .git Owner
+      shell: bash
+      run: sudo chown runner:docker -R .git
+
+    - name: Update Pull Request
+      uses: actions/github-script@v6
+      if: github.event_name == 'pull_request' && env.auto_format != 'true'
+      with:
+        github-token: ${{ secrets.GH_TOKEN }}
+        script: |
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          })
+          const botComment = comments.find(comment => {
+            return comment.user.type === 'Bot' && comment.body.includes('Terraform Format and Style')
+          })
+
+          const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+          #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+          #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+          #### Terraform Test \`${{ steps.test.outcome }}\`
+          <details><summary>Test Output</summary>
+
+          \`\`\`\n
+          ${{ steps.test.outputs.stdout }}
+          \`\`\`
+
+          </details>
+
+          *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ env.tf_actions_working_dir }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+          if (botComment) {
+            github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: botComment.id,
+              body: output
+            })
+          } else {
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+    - name: Commit & Push Changes
+      if: ${{ github.event_name == 'pull_request' }}
+      shell: bash
+      run: |
+        if ! git diff-index --quiet HEAD; then 
+          git status
+          remote_repo="https://${{inputs.github_username}}:${{secrets.GH_TOKEN}}@${{ inputs.github_server }}/${{ github.repository }}.git"
+          git remote add repo ${remote_repo}
+          git config http.sslVerify false
+          git config --local user.email "${{inputs.github_email}}"
+          git config --local user.name "${{inputs.github_username}}"
+          git add .
+          git commit -m "${{inputs.autoformat_message}}"
+          git push -u repo ${{ github.head_ref }}
+          echo "auto_format=true" >> $GITHUB_ENV 
+        fi
+
+    - name: Autoformat Halt
+      shell: bash
+      if: env.auto_format == 'true'
+      run: exit 0
+
+    - name: Terraform Test Status
+      if: steps.test.outcome == 'failure'
+      shell: bash
+      run: exit 1
+
+    - name: Terraform Init Status
+      if: steps.init.outcome == 'failure'
+      shell: bash
+      run: exit 1
+
+    - name: Terraform FMT Status
+      if: steps.fmt.outcome == 'failure'
+      shell: bash
+      run: exit 1
+
+    - name: Terraform Validate Status
+      if: steps.validate.outcome == 'failure'
+      shell: bash
+      run: exit 1
